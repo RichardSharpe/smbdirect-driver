@@ -18,6 +18,7 @@
 #include <linux/string.h>
 #include <linux/module.h>
 #include <linux/socket.h>
+#include <linux/ioctl.h>
 #include <linux/in.h>
 #include <linux/in6.h>
 #include <rdma/ib_verbs.h>
@@ -37,7 +38,8 @@ static int read_proc_stuff(char *buf, char **start, off_t offset,
 	int len = 0;
 
 	len += sprintf(buf + len, " %s: Loaded with major = %u, minor = %u\n",
-			"smbdirect", MAJOR(smbdirect_dev_no),
+			"smbdirect",
+			MAJOR(smbdirect_dev_no),
 			MINOR(smbdirect_dev_no));
 	*eof = 1;
 	return len;
@@ -59,11 +61,70 @@ int smbd_release(struct inode *inode, struct file *filp)
 	return 0;
 }
 
+/*
+ * Relocate these definitions to a .h file
+ */
+#define SMBD_IOC_VAL 's'
+#define SMBD_SET_PARAMS     _IOR(SMBD_IOC_VAL, 1, void *)
+#define SMBD_GET_MEM_PARAMS _IOW(SMBD_IOC_VAL, 2, void *)
+#define SMBD_SET_SESSION_ID _IOR(SMBD_IOC_VAL, 3, void *)
+
+/*
+ * Get the params and mark us as initialized
+ */
+long handle_set_params(unsigned long arg)
+{
+	int res = 0;
+	struct smbd_params *params = (void __user *)arg;
+
+	res = copy_from_user(&smbd_device.params, 
+			params, 
+			sizeof(struct smbd_params));
+
+	if (!res) {
+		printk(KERN_ERR "Error: Memory for SMBD_SET_PARAMS "
+			"not accessible\n");
+		return -EFAULT;
+	}
+
+	/*
+	 * Check the values and also copy the blob
+	 */
+
+	/*
+	 * We are initialized now
+	 */
+	smbd_device.initialized = 1;
+
+	return res;
+}
+
 long smbd_ioctl(struct file *filp, unsigned int cmd,
 		unsigned long arg)
 {
+	int res = -EINVAL;
 
-	return 0;
+	printk(KERN_INFO "Handling ioctl: %0X\n", cmd);
+
+	switch (cmd) {
+	case SMBD_SET_PARAMS:
+		return handle_set_params(arg);
+		break;
+
+	case SMBD_GET_MEM_PARAMS:
+
+		break;
+
+	case SMBD_SET_SESSION_ID:
+
+		break;
+
+	default:
+
+		break;
+	}
+
+	return res;
 }
 
 struct file_operations smbd_fops = {
