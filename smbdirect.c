@@ -38,6 +38,7 @@
  * The port number we listen on
  */
 #define SMB_DIRECT_PORT 5445
+#define MAX_CQ_DEPTH 128
 
 /* Our device number, for reporting */
 dev_t smbdirect_dev_no;
@@ -145,15 +146,80 @@ struct file_operations smbd_fops = {
 };
 
 /*
+ * Handle a completion event ...
+ */
+static void handle_completion_event(struct ib_cq *cq, void *ctx)
+{
+
+}
+
+/*
+ * Handle connection requests ... build a new connection and set up the 
+ * protection domain, completion queue and queue pair.
+ */
+static int
+handle_connect_request(struct rdma_cm_id *cm_id,
+		       struct smbd_device *smbd_dev)
+{
+	int res = 0;
+	struct connection_struct *conn = NULL;
+	
+	conn = kzalloc(sizeof(conn), GFP_KERNEL);
+	if (!conn) {
+		printk(KERN_ERR "Unable to allocate connection\n");
+		return -ENOMEM;
+	}
+
+	conn->cm_id = cm_id;
+	conn->dev = smbd_dev;
+
+	/*
+	 * No allocate a protection domain, completion queue etc.
+	 */
+	conn->pd = ib_alloc_pd(cm_id->device);
+	if (IS_ERR(conn->pd)) {
+		res = PTR_ERR(conn->pd);
+		printk(KERN_ERR "Allocation of PD failed: %d\n", res);
+		goto clean_conn;
+	}
+
+	conn->cq = ib_create_cq(cm_id->device, 
+				handle_completion_event,
+				NULL,
+				conn,
+				MAX_CQ_DEPTH,
+				0);
+	return res;
+
+clean_conn:
+	kfree(conn);
+	return res;
+}
+
+/*
  * Handle CMA events ...
  */
 static int
 smbd_cma_handler(struct rdma_cm_id *cma_id,
 		 struct rdma_cm_event *event)
 {
-	int ret = 0;
+	int res = 0;
+	struct smbd_device *smbd_dev = cma_id->context;
 
-	return ret;
+	printk(KERN_INFO "cma_event type %d cma_id %p\n",
+		event->event, cma_id);
+
+	switch (event->event) {
+	case RDMA_CM_EVENT_CONNECT_REQUEST:
+		handle_connect_request(cma_id, smbd_dev);
+		break;
+	case RDMA_CM_EVENT_DEVICE_REMOVAL:
+	default:
+		printk(KERN_ERR "Unknown event type: %d\n", event->event);
+		break;
+	}
+
+	return res;
 }
 
 /*
@@ -204,7 +270,7 @@ setup_listen(struct smbd_device *smbd_dev)
 		goto unlisten;
 	}
 
-	printk(KERN_INFO "rdma_listen done\n");
+	printk(KERN_INFO "rdma_listen done, lid %p\n", smbd_lid);
 
 	/* The callback function will handle things from here ... */
 

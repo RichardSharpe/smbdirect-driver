@@ -55,13 +55,13 @@ struct connection_struct {
 	/*
 	 * RDMA stuff
 	 */
-	struct rdma_cm_id cm_id;
+	struct rdma_cm_id *cm_id;
 	struct ib_cq *cq;
 	struct ib_pd *pd;
 	struct ib_qp *qp;
 	/*
 	 * The device we are related to ...
 	 */
-	struct smb_device *dev;
+	struct smbd_device *dev;
 };
 
