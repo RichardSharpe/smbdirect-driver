@@ -17,6 +17,7 @@
 
 #include <linux/spinlock.h>
 #include <linux/cdev.h>
+#include <rdma/rdma_cm.h>
 
 struct smbd_params {
 	unsigned int rcv_credit_max;
@@ -38,6 +39,10 @@ struct smbd_device {
 	 */
 	struct list_head connection_list;
 	struct cdev cdev;
+	/*
+	 * RDMA Related stuff, including our listen port.
+	 */
+	struct rdma_cm_id *cm_lid;
 };
 
 /*
@@ -47,6 +52,16 @@ struct connection_struct {
 	struct list_head connect_ent;
 	unsigned int connected;
 	unsigned long long session_id;
+	/*
+	 * RDMA stuff
+	 */
+	struct rdma_cm_id cm_id;
+	struct ib_cq *cq;
+	struct ib_pd *pd;
+	struct ib_qp *qp;
+	/*
+	 * The device we are related to ...
+	 */
 	struct smb_device *dev;
 };
 

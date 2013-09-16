@@ -15,16 +15,29 @@
  * GNU General Public License for more details.
  ****************************************************************************/
 
+#include <linux/init.h>
 #include <linux/string.h>
 #include <linux/module.h>
 #include <linux/socket.h>
 #include <linux/ioctl.h>
-#include <linux/in.h>
+#include <linux/inet.h>
+#include <uapi/linux/in.h>
 #include <linux/in6.h>
 #include <rdma/ib_verbs.h>
 #include <rdma/rdma_cm.h>
+#include <linux/seq_file.h>
 
 #include "smbdirect.h"
+
+/*
+ * TODO: Convert to using dev_dbg, but probably need a platform_device for
+ * that.
+ */
+
+/*
+ * The port number we listen on
+ */
+#define SMB_DIRECT_PORT 5445
 
 /* Our device number, for reporting */
 dev_t smbdirect_dev_no;
@@ -32,17 +45,14 @@ dev_t smbdirect_dev_no;
 /*
  * A /proc file for some debugging ... replace this with configfs stuff ...
  */
-static int read_proc_stuff(char *buf, char **start, off_t offset,
-			int count, int *eof, void *data)
+static int read_proc_stuff(struct seq_file *m, void *data)
 {
-	int len = 0;
 
-	len += sprintf(buf + len, " %s: Loaded with major = %u, minor = %u\n",
+	seq_printf(m, " %s: Loaded with major = %u, minor = %u\n",
 			"smbdirect",
 			MAJOR(smbdirect_dev_no),
 			MINOR(smbdirect_dev_no));
-	*eof = 1;
-	return len;
+	return 0;
 }
 
 /*
@@ -134,12 +144,110 @@ struct file_operations smbd_fops = {
 	.release = smbd_release,
 };
 
+/*
+ * Handle CMA events ...
+ */
+static int
+smbd_cma_handler(struct rdma_cm_id *cma_id,
+		 struct rdma_cm_event *event)
+{
+	int ret = 0;
+
+	return ret;
+}
+
+/*
+ * Set up an RDMA CM Listen on our port ... and pass the device struct as
+ * the context ...
+ *
+ * TODO: Generalize to IPV6 as well as IPV4.
+ */
+static int
+setup_listen(struct smbd_device *smbd_dev)
+{
+	int res = 0;
+	struct rdma_cm_id *smbd_lid = NULL;
+	struct sockaddr_in sa;
+
+	smbd_lid = rdma_create_id(smbd_cma_handler,
+				  smbd_dev,
+				  RDMA_PS_TCP,
+				  IB_QPT_RC);
+	if (IS_ERR(smbd_lid)) {
+		res = PTR_ERR(smbd_lid);
+		printk(KERN_ERR "rdma_create_id error %d\n", res);
+		goto err;
+	}
+
+	smbd_dev->cm_lid = smbd_lid;
+
+	/*
+	 * Now bind to INADDR_ANY and our port.
+	 */
+	memset(&sa, 0, sizeof(sa));
+	sa.sin_family = AF_INET;
+	sa.sin_addr.s_addr = INADDR_ANY;
+	sa.sin_port = SMB_DIRECT_PORT;
+
+	res = rdma_bind_addr(smbd_lid, (struct sockaddr *)&sa);
+	if (res) {
+		printk(KERN_ERR "rdma_bind_addr error %d\n", res);
+		goto unlisten;
+	}
+
+	printk(KERN_INFO "rdma_bind_addr done\n");
+
+	/* TODO, allow the backlog to be tuned */
+	res = rdma_listen(smbd_lid, 5);
+	if (res) {
+		printk(KERN_ERR "rdma_listen failed %d\n", res);
+		goto unlisten;
+	}
+
+	printk(KERN_INFO "rdma_listen done\n");
+
+	/* The callback function will handle things from here ... */
+
+	return res;
+
+unlisten:
+	rdma_destroy_id(smbd_lid);
+err:
+	return res;
+}
+
+/*
+ * Tear down the listens and any connections ...
+ */
+static int teardown_listen_connections(struct smbd_device *smbd_dev)
+{
+	int res = 0;
+
+	/* We need to go through the list of connections and drop them */
+
+	if (smbd_dev->cm_lid)
+		rdma_destroy_id(smbd_dev->cm_lid);
+
+	return res;
+}
+
+static int smbd_proc_rd_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, read_proc_stuff, NULL);
+}
+
+static const struct file_operations smbd_proc_rd_fops = {
+	.open = smbd_proc_rd_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = seq_release,
+};
+
 static int __init smbdirect_init(void)
 {
 	int res = 0;
 
-	create_proc_read_entry("driver/smbdirect", 0, NULL, 
-				read_proc_stuff, NULL);
+	proc_create("driver/smbdirect", 0, NULL, &smbd_proc_rd_fops);
 
 	/*
 	 * Allocate a new device major number
@@ -160,12 +268,18 @@ static int __init smbdirect_init(void)
 		goto no_cdev;
 	}
 
+	/*
+	 * This should be called in the open function when we have initialized
+	 */
+	res = setup_listen(&smbd_device);
+
 no_cdev:
 	return res;
 }
 
 static void __exit smbdirect_exit(void)
 {
+	(void)teardown_listen_connections(&smbd_device);
 	cdev_del(&smbd_device.cdev);
 	remove_proc_entry("driver/smbdirect", NULL);
 }
