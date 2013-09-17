@@ -38,6 +38,8 @@
  * The port number we listen on
  */
 #define SMB_DIRECT_PORT 5445
+
+/* Max CQ depth per queue ... */
 #define MAX_CQ_DEPTH 128
 
 /* Our device number, for reporting */
@@ -163,6 +165,7 @@ handle_connect_request(struct rdma_cm_id *cm_id,
 {
 	int res = 0;
 	struct connection_struct *conn = NULL;
+	struct ib_qp_init_attr conn_attr;
 	
 	conn = kzalloc(sizeof(conn), GFP_KERNEL);
 	if (!conn) {
@@ -187,11 +190,39 @@ handle_connect_request(struct rdma_cm_id *cm_id,
 				handle_completion_event,
 				NULL,
 				conn,
-				MAX_CQ_DEPTH,
+				MAX_CQ_DEPTH * 2,
 				0);
+	if (IS_ERR(conn->cq)) {
+		res = PTR_ERR(conn->cq);
+		printk(KERN_ERR "Unable to create completion queue: %d\n",
+			res);
+		goto clean_pd;
+	}
+
+	memset(&conn_attr, 0, sizeof(conn_attr));
+	conn_attr.cap.max_send_wr = MAX_CQ_DEPTH;
+	conn_attr.cap.max_recv_wr = MAX_CQ_DEPTH;
+	conn_attr.cap.max_recv_sge = 1;
+	conn_attr.cap.max_send_sge = 1;
+	conn_attr.qp_type = IB_QPT_RC;
+	conn_attr.send_cq = conn->cq;
+	conn_attr.recv_cq = conn->cq;
+	conn_attr.sq_sig_type = IB_SIGNAL_REQ_WR;
+
+	res = rdma_create_qp(conn->cm_id, conn->pd, &conn_attr);
+	if (!res) {
+		printk(KERN_ERR "Unable to create queue pair: %d\n", res);
+		goto clean_cq;
+	}
+
 	return res;
 
+clean_cq:
+	ib_destroy_cq(conn->cq);
+clean_pd:
+	ib_dealloc_pd(conn->pd);
 clean_conn:
+	rdma_destroy_id(conn->cm_id);
 	kfree(conn);
 	return res;
 }
