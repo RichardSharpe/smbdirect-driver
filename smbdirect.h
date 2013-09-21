@@ -60,6 +60,22 @@ struct connection_struct {
 	struct ib_pd *pd;
 	struct ib_qp *qp;
 	/*
+	 * Structures for sending and receiving RDMA stuff
+	 */
+	struct ib_recv_wr recv_wr; /* Initial receive ... */
+	struct ib_sge recv_sgl;    /* Single SGE for now */
+	struct ib_mr *recv_mr;
+	struct ib_send_wr send_wr;
+	struct ib_sge send_sgl;
+	struct ib_mr *send_mr;
+	/*
+	 * Buffers ...
+	 */
+	char recv_buf[20];         /* an SMB Direct  Negotiate req */
+	u64 recv_buf_dma;
+	char send_buf[32];	   /* The SMB Direct Neg response  */
+	u64 send_buf_dma;
+	/*
 	 * The device we are related to ...
 	 */
 	struct smbd_device *dev;

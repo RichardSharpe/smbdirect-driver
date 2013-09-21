@@ -148,11 +148,25 @@ struct file_operations smbd_fops = {
 };
 
 /*
+ * Clean up buffers etc ...
+ */
+static void
+smbd_free_buffers(struct connection_struct *conn)
+{
+	if (conn->recv_mr)
+		ib_dereg_mr(conn->recv_mr);
+	ib_dma_unmap_single(conn->cm_id->device,
+			    conn->recv_buf_dma,
+			    sizeof(conn->recv_buf),
+			    DMA_FROM_DEVICE);
+}
+
+/*
  * Handle a completion event ...
  */
 static void handle_completion_event(struct ib_cq *cq, void *ctx)
 {
-
+	printk(KERN_INFO "Handling a completion event ...\n");
 }
 
 /*
@@ -166,6 +180,8 @@ handle_connect_request(struct rdma_cm_id *cm_id,
 	int res = 0;
 	struct connection_struct *conn = NULL;
 	struct ib_qp_init_attr conn_attr;
+	struct rdma_conn_param cparam;
+	struct ib_recv_wr *bad_wr;
 	
 	conn = kzalloc(sizeof(conn), GFP_KERNEL);
 	if (!conn) {
@@ -177,7 +193,7 @@ handle_connect_request(struct rdma_cm_id *cm_id,
 	conn->dev = smbd_dev;
 
 	/*
-	 * No allocate a protection domain, completion queue etc.
+	 * Now allocate a protection domain, completion queue etc.
 	 */
 	conn->pd = ib_alloc_pd(cm_id->device);
 	if (IS_ERR(conn->pd)) {
@@ -215,8 +231,61 @@ handle_connect_request(struct rdma_cm_id *cm_id,
 		goto clean_cq;
 	}
 
+	/*
+	 * Setup the receive buff params for first receive
+	 */
+	conn->recv_buf_dma = ib_dma_map_single(conn->cm_id->device,
+					       conn->recv_buf,
+					       sizeof(conn->recv_buf),
+					       DMA_FROM_DEVICE);
+	res = ib_dma_mapping_error(conn->cm_id->device, conn->recv_buf_dma);
+	if (res) {
+		printk(KERN_ERR "Failed to create DMA mapping: %d\n", res);
+		goto clean_dma;
+	}
+
+	conn->recv_mr = ib_get_dma_mr(conn->pd, IB_ACCESS_LOCAL_WRITE);
+
+	/*
+	 * Set up the work request ...
+	 */
+	conn->recv_sgl.addr = conn->recv_buf_dma;
+	conn->recv_sgl.length = sizeof(conn->recv_buf);
+	conn->recv_sgl.lkey = conn->recv_mr->lkey;
+
+	conn->recv_wr.sg_list = &conn->recv_sgl;
+	conn->recv_wr.num_sge = 1;
+
+	/*
+	 * Post that receive before we accept
+	 */
+	res = ib_post_recv(conn->qp, &conn->recv_wr, &bad_wr);
+	/*
+	 * Accept the request ...
+	 */
+	memset(&cparam, 0, sizeof(cparam));
+	cparam.responder_resources = 1;
+	cparam.initiator_depth = 1;
+
+	res = rdma_accept(cm_id, &cparam);
+	if (res) {
+		printk(KERN_ERR "Unable to accept connection: %d\n", res);
+		goto clean_recv;
+	}
+
 	return res;
 
+clean_recv:
+
+clean_dma:
+	if (conn->recv_mr)
+		ib_dereg_mr(conn->recv_mr);
+	ib_dma_unmap_single(conn->cm_id->device,
+			    conn->recv_buf_dma,
+			    sizeof(conn->recv_buf),
+			    DMA_FROM_DEVICE);
+/*clean_qp: */
+	ib_destroy_qp(conn->qp);
 clean_cq:
 	ib_destroy_cq(conn->cq);
 clean_pd:
@@ -316,11 +385,26 @@ err:
 /*
  * Tear down the listens and any connections ...
  */
-static int teardown_listen_connections(struct smbd_device *smbd_dev)
+static int teardown_listen_and_connections(struct smbd_device *smbd_dev)
 {
 	int res = 0;
+	struct connection_struct *conn, *temp;
 
 	/* We need to go through the list of connections and drop them */
+	list_for_each_entry_safe(conn, 
+				temp,
+				&smbd_dev->connection_list, 
+				connect_ent) {
+
+		rdma_disconnect(conn->cm_id);
+		smbd_free_buffers(conn);
+
+		ib_destroy_qp(conn->qp);
+		ib_destroy_cq(conn->cq);
+		ib_dealloc_pd(conn->pd);
+
+		rdma_destroy_id(conn->cm_id);
+	}
 
 	if (smbd_dev->cm_lid)
 		rdma_destroy_id(smbd_dev->cm_lid);
@@ -356,6 +440,7 @@ static int __init smbdirect_init(void)
 	}
 
 	memset(&smbd_device, 0, sizeof(smbd_device));
+	INIT_LIST_HEAD(&smbd_device.connection_list);
 	cdev_init(&smbd_device.cdev, &smbd_fops);
 	smbd_device.cdev.owner = THIS_MODULE;
 
@@ -376,7 +461,7 @@ no_cdev:
 
 static void __exit smbdirect_exit(void)
 {
-	(void)teardown_listen_connections(&smbd_device);
+	(void)teardown_listen_and_connections(&smbd_device);
 	cdev_del(&smbd_device.cdev);
 	remove_proc_entry("driver/smbdirect", NULL);
 }
