@@ -162,6 +162,22 @@ smbd_free_buffers(struct connection_struct *conn)
 }
 
 /*
+ * Clean up a connection ...
+ */
+static void
+smbd_clean_connection(struct connection_struct *conn)
+{
+	rdma_disconnect(conn->cm_id);
+	smbd_free_buffers(conn);
+
+	ib_destroy_qp(conn->qp);
+	ib_destroy_cq(conn->cq);
+	ib_dealloc_pd(conn->pd);
+
+	rdma_destroy_id(conn->cm_id);
+}
+
+/*
  * Handle a completion event ...
  */
 static void handle_completion_event(struct ib_cq *cq, void *ctx)
@@ -227,7 +243,8 @@ done:
 
 /*
  * Handle connection requests ... build a new connection and set up the 
- * protection domain, completion queue and queue pair.
+ * protection domain, completion queue and queue pair, hang a receive and
+ * accept the connection.
  */
 static int
 handle_connect_request(struct rdma_cm_id *cm_id,
@@ -260,8 +277,6 @@ handle_connect_request(struct rdma_cm_id *cm_id,
 		goto clean_conn;
 	}
 
-	printk(KERN_INFO "Allocated protection domain ...\n");
-
 	conn->cq = ib_create_cq(cm_id->device, 
 				handle_completion_event,
 				NULL,
@@ -275,8 +290,6 @@ handle_connect_request(struct rdma_cm_id *cm_id,
 		goto clean_pd;
 	}
 
-	printk(KERN_INFO "Created completion queue ...\n");
-
 	/*
 	 * Request notifies on that completion queue
 	 */
@@ -286,11 +299,9 @@ handle_connect_request(struct rdma_cm_id *cm_id,
 		goto clean_cq;
 	}
 
-	printk(KERN_INFO "Requested notifies ...\n");
-
 	memset(&conn_attr, 0, sizeof(conn_attr));
-	conn_attr.cap.max_send_wr = MAX_CQ_DEPTH;
-	conn_attr.cap.max_recv_wr = 2;
+	conn_attr.cap.max_send_wr = 10;
+	conn_attr.cap.max_recv_wr = 10;
 	conn_attr.cap.max_recv_sge = 2;
 	conn_attr.cap.max_send_sge = 2;
 	conn_attr.qp_type = IB_QPT_RC;
@@ -304,7 +315,7 @@ handle_connect_request(struct rdma_cm_id *cm_id,
 		goto clean_cq;
 	}
 
-	printk(KERN_INFO "Created completion queues ...\n");
+	conn->qp = conn->cm_id->qp;
 
 	/*
 	 * Setup the receive buff params for first receive
@@ -321,8 +332,6 @@ handle_connect_request(struct rdma_cm_id *cm_id,
 
 	conn->recv_mr = ib_get_dma_mr(conn->pd, IB_ACCESS_LOCAL_WRITE);
 
-	printk(KERN_INFO "Setup DMA and obtained MR descriptor ...\n");
-
 	/*
 	 * Set up the work request ...
 	 */
@@ -332,13 +341,16 @@ handle_connect_request(struct rdma_cm_id *cm_id,
 
 	conn->recv_wr.sg_list = &conn->recv_sgl;
 	conn->recv_wr.num_sge = 1;
+	conn->recv_wr.next = NULL;
 
 	/*
 	 * Post that receive before we accept
 	 */
 	res = ib_post_recv(conn->qp, &conn->recv_wr, &bad_wr);
-
-	printk(KERN_INFO "Posted the recv ...\n");
+	if (res) {
+		printk(KERN_ERR "Unable to post a recv: %d\n", res);
+		goto clean_recv;
+	}
 
 	/*
 	 * Accept the request ...
@@ -352,6 +364,11 @@ handle_connect_request(struct rdma_cm_id *cm_id,
 		printk(KERN_ERR "Unable to accept connection: %d\n", res);
 		goto clean_recv;
 	}
+
+	cm_id->context = conn; /* How we find it again */
+	mutex_lock(&smbd_dev->connection_list_mutex);
+	list_add_tail(&smbd_dev->connection_list, &conn->connect_ent);
+	mutex_unlock(&smbd_dev->connection_list_mutex);
 
 	printk(KERN_INFO "Accepted the connection ...\n");
 
@@ -379,6 +396,31 @@ clean_conn:
 }
 
 /*
+ * Handle a connection disconnect. Simply clean the connection, delete it
+ * from the list and free it.
+ */
+static int
+handle_disconnect(struct rdma_cm_id *cma_id)
+{
+	int res = 0;
+	struct connection_struct *conn = cma_id->context;
+	struct smbd_device *smbd_dev = conn->dev;
+
+	printk(KERN_INFO "Handling disconnect for %p\n", conn);
+
+	smbd_free_buffers(conn);
+	smbd_clean_connection(conn);
+
+	mutex_lock(&smbd_dev->connection_list_mutex);
+	list_del(&conn->connect_ent);
+	mutex_unlock(&smbd_dev->connection_list_mutex);
+
+	kfree(conn);
+
+	return res;
+}
+
+/*
  * Handle CMA events ...
  */
 static int
@@ -393,9 +435,13 @@ smbd_cma_handler(struct rdma_cm_id *cma_id,
 
 	switch (event->event) {
 	case RDMA_CM_EVENT_CONNECT_REQUEST:
-		handle_connect_request(cma_id, smbd_dev);
+		res = handle_connect_request(cma_id, smbd_dev);
+		break;
+	case RDMA_CM_EVENT_DISCONNECTED:
+		res = handle_disconnect(cma_id);
 		break;
 	case RDMA_CM_EVENT_DEVICE_REMOVAL:
+
 	default:
 		printk(KERN_ERR "Unknown event type: %d\n", event->event);
 		break;
@@ -473,6 +519,7 @@ static int teardown_listen_and_connections(struct smbd_device *smbd_dev)
 	struct connection_struct *conn, *temp;
 
 	/* We need to go through the list of connections and drop them */
+	mutex_lock(&smbd_dev->connection_list_mutex);
 	list_for_each_entry_safe(conn, 
 				temp,
 				&smbd_dev->connection_list, 
@@ -486,7 +533,11 @@ static int teardown_listen_and_connections(struct smbd_device *smbd_dev)
 		ib_dealloc_pd(conn->pd);
 
 		rdma_destroy_id(conn->cm_id);
+
+		list_del(&conn->connect_ent);
+		kfree(conn);
 	}
+	mutex_unlock(&smbd_dev->connection_list_mutex);
 
 	if (smbd_dev->cm_lid)
 		rdma_destroy_id(smbd_dev->cm_lid);
@@ -522,6 +573,7 @@ static int __init smbdirect_init(void)
 	}
 
 	memset(&smbd_device, 0, sizeof(smbd_device));
+	mutex_init(&smbd_device.connection_list_mutex);
 	INIT_LIST_HEAD(&smbd_device.connection_list);
 	cdev_init(&smbd_device.cdev, &smbd_fops);
 	smbd_device.cdev.owner = THIS_MODULE;

@@ -33,7 +33,7 @@ struct smbd_params {
 struct smbd_device {
 	int initialized;
 	struct smbd_params params;
-	spinlock_t connection_list_lock; /* Controls connection list */
+	struct mutex connection_list_mutex; /* Controls access to the list */
 	/*
 	 * List of connections or pending connections
 	 */
