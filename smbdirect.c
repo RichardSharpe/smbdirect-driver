@@ -166,7 +166,63 @@ smbd_free_buffers(struct connection_struct *conn)
  */
 static void handle_completion_event(struct ib_cq *cq, void *ctx)
 {
+	struct connection_struct *conn = ctx;
+	int res = 0;
+	struct ib_wc wc;
+
 	printk(KERN_INFO "Handling a completion event ...\n");
+
+	if (conn->cq != cq) {
+		printk(KERN_ERR "The completion queue is wrong: %p, %p\n",
+			conn->cq, cq);
+		return;
+	}
+
+	/*
+	 * Get all the available completions ...
+	 */
+	while ((res = ib_poll_cq(conn->cq, 1, &wc)) == 1) {
+		switch (wc.opcode) {
+		case IB_WC_SEND:
+			printk(KERN_INFO "SEND completion ...\n");
+			break;
+
+		case IB_WC_RECV:
+			printk(KERN_INFO "RECV completion ...\n");
+			break;
+
+		case IB_WC_RDMA_WRITE:
+			printk(KERN_INFO "RDMA_WRITE completion ...\n");
+			break;
+
+		case IB_WC_RDMA_READ:
+			printk(KERN_INFO "RDMA_READ completion ...\n");
+			break;
+
+		default:
+			printk(KERN_ERR "%s:%d Unexpected completion: %d\n",
+				__func__, __LINE__, wc.opcode);
+			break;
+		}
+	}
+
+	if (res) {
+		printk(KERN_ERR "%s: ib poll error: %d\n", __func__, res);
+
+		/* Nothing more can be done ... */
+		goto done;
+	}
+
+	/*
+	 * Make sure we get some more completion events.
+	 */
+	res = ib_req_notify_cq(conn->cq, IB_CQ_NEXT_COMP);
+	if (res) {
+		printk(KERN_ERR "Could not request notification: %d\n", res);
+	}
+
+done:
+	return;
 }
 
 /*
@@ -213,6 +269,15 @@ handle_connect_request(struct rdma_cm_id *cm_id,
 		printk(KERN_ERR "Unable to create completion queue: %d\n",
 			res);
 		goto clean_pd;
+	}
+
+	/*
+	 * Request notifies on that completion queue
+	 */
+	res = ib_req_notify_cq(conn->cq, IB_CQ_NEXT_COMP);
+	if (res) {
+		printk(KERN_ERR "Unable to request notifications: %d\n", res);
+		goto clean_cq;
 	}
 
 	memset(&conn_attr, 0, sizeof(conn_attr));
