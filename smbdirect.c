@@ -238,6 +238,8 @@ handle_connect_request(struct rdma_cm_id *cm_id,
 	struct ib_qp_init_attr conn_attr;
 	struct rdma_conn_param cparam;
 	struct ib_recv_wr *bad_wr;
+
+	printk(KERN_INFO "Handling connection request ...\n");
 	
 	conn = kzalloc(sizeof(conn), GFP_KERNEL);
 	if (!conn) {
@@ -258,6 +260,8 @@ handle_connect_request(struct rdma_cm_id *cm_id,
 		goto clean_conn;
 	}
 
+	printk(KERN_INFO "Allocated protection domain ...\n");
+
 	conn->cq = ib_create_cq(cm_id->device, 
 				handle_completion_event,
 				NULL,
@@ -271,6 +275,8 @@ handle_connect_request(struct rdma_cm_id *cm_id,
 		goto clean_pd;
 	}
 
+	printk(KERN_INFO "Created completion queue ...\n");
+
 	/*
 	 * Request notifies on that completion queue
 	 */
@@ -280,21 +286,25 @@ handle_connect_request(struct rdma_cm_id *cm_id,
 		goto clean_cq;
 	}
 
+	printk(KERN_INFO "Requested notifies ...\n");
+
 	memset(&conn_attr, 0, sizeof(conn_attr));
 	conn_attr.cap.max_send_wr = MAX_CQ_DEPTH;
-	conn_attr.cap.max_recv_wr = MAX_CQ_DEPTH;
-	conn_attr.cap.max_recv_sge = 1;
-	conn_attr.cap.max_send_sge = 1;
+	conn_attr.cap.max_recv_wr = 2;
+	conn_attr.cap.max_recv_sge = 2;
+	conn_attr.cap.max_send_sge = 2;
 	conn_attr.qp_type = IB_QPT_RC;
 	conn_attr.send_cq = conn->cq;
 	conn_attr.recv_cq = conn->cq;
 	conn_attr.sq_sig_type = IB_SIGNAL_REQ_WR;
 
 	res = rdma_create_qp(conn->cm_id, conn->pd, &conn_attr);
-	if (!res) {
+	if (res) {
 		printk(KERN_ERR "Unable to create queue pair: %d\n", res);
 		goto clean_cq;
 	}
+
+	printk(KERN_INFO "Created completion queues ...\n");
 
 	/*
 	 * Setup the receive buff params for first receive
@@ -311,6 +321,8 @@ handle_connect_request(struct rdma_cm_id *cm_id,
 
 	conn->recv_mr = ib_get_dma_mr(conn->pd, IB_ACCESS_LOCAL_WRITE);
 
+	printk(KERN_INFO "Setup DMA and obtained MR descriptor ...\n");
+
 	/*
 	 * Set up the work request ...
 	 */
@@ -325,6 +337,9 @@ handle_connect_request(struct rdma_cm_id *cm_id,
 	 * Post that receive before we accept
 	 */
 	res = ib_post_recv(conn->qp, &conn->recv_wr, &bad_wr);
+
+	printk(KERN_INFO "Posted the recv ...\n");
+
 	/*
 	 * Accept the request ...
 	 */
@@ -337,6 +352,8 @@ handle_connect_request(struct rdma_cm_id *cm_id,
 		printk(KERN_ERR "Unable to accept connection: %d\n", res);
 		goto clean_recv;
 	}
+
+	printk(KERN_INFO "Accepted the connection ...\n");
 
 	return res;
 
@@ -418,7 +435,7 @@ setup_listen(struct smbd_device *smbd_dev)
 	memset(&sa, 0, sizeof(sa));
 	sa.sin_family = AF_INET;
 	sa.sin_addr.s_addr = INADDR_ANY;
-	sa.sin_port = SMB_DIRECT_PORT;
+	sa.sin_port = ntohs(SMB_DIRECT_PORT);
 
 	res = rdma_bind_addr(smbd_lid, (struct sockaddr *)&sa);
 	if (res) {
