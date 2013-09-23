@@ -167,14 +167,143 @@ smbd_free_buffers(struct connection_struct *conn)
 static void
 smbd_clean_connection(struct connection_struct *conn)
 {
-	rdma_disconnect(conn->cm_id);
 	smbd_free_buffers(conn);
+	rdma_disconnect(conn->cm_id);
 
 	ib_destroy_qp(conn->qp);
 	ib_destroy_cq(conn->cq);
 	ib_dealloc_pd(conn->pd);
 
 	rdma_destroy_id(conn->cm_id);
+}
+
+/*
+ * Start a send ... if an error occurs, set the state to ERROR and let others
+ * clean up.
+ */
+static void
+start_send(struct connection_struct *conn)
+{
+	int res = 0;
+	struct ib_send_wr *bad_wr;
+
+	conn->send_buf_dma = ib_dma_map_single(conn->cm_id->device,
+					       conn->send_buf,
+					       sizeof(conn->send_buf),
+					       DMA_TO_DEVICE);
+	res = ib_dma_mapping_error(conn->cm_id->device, conn->send_buf_dma);
+	if (res) {
+		printk(KERN_ERR "Failed to create send DMA mapping: %d\n", res);
+		goto error;
+	}
+
+	conn->recv_mr = ib_get_dma_mr(conn->pd, 0);
+	if (IS_ERR(conn->recv_mr)) {
+		printk(KERN_ERR "Failed to get the send MR: %ld\n",
+			PTR_ERR(conn->recv_mr));
+		goto error_dma;
+	}
+
+	/*
+	 * Set up the work request ...
+	 */
+	conn->send_sgl.addr = conn->send_buf_dma;
+	conn->send_sgl.length = sizeof(conn->send_buf);
+	conn->send_sgl.lkey = conn->send_mr->lkey;
+
+	conn->send_wr.sg_list = &conn->send_sgl;
+	conn->send_wr.num_sge = 1;
+	conn->send_wr.next = NULL;
+
+	res = ib_post_send(conn->qp, &conn->send_wr, &bad_wr);
+	if (res) {
+		printk(KERN_ERR "Unable to post a send: %d\n", res);
+		goto error_mr;
+	}
+	return;
+
+error_mr:
+	ib_dereg_mr(conn->send_mr);
+error_dma:
+	ib_dma_unmap_single(conn->cm_id->device,
+			    conn->send_buf_dma,
+			    sizeof(conn->send_buf),
+			    DMA_TO_DEVICE);
+error:	
+	conn->state = SMBD_ERROR;
+}
+
+/*
+ * Handle a recv completion.
+ *
+ * This is a state machine. If we are in SMBD_NEGOTIATE, then handle the
+ * NEGOTIATE request. If in SMBD_TRANSFER state, then we have PDUs to deal
+ * with.
+ */
+static int
+handle_recv_completion(struct ib_wc *wc, struct connection_struct *conn)
+{
+	int res = 0;
+	struct smbd_negotiate_req *neg_req;
+	struct smbd_negotiate_resp *neg_resp;
+
+	switch (conn->state) {
+	case SMBD_NEGOTIATE:
+		if (wc->byte_len != sizeof(struct smbd_negotiate_req)) {
+			printk(KERN_ERR "Incorrect negotiate request size: "
+				"%d, dropping connection\n", wc->byte_len);
+			conn->state = SMBD_ERROR;
+			break;
+		}
+
+		neg_req = (struct smbd_negotiate_req *)conn->recv_buf;
+		printk(KERN_INFO "Negotiate request. Length: %lu.\n"
+			"\tMin version: 0x%04x,"
+			"Max version: 0x%04x, Credits requested: %d\n",
+			sizeof(struct smbd_negotiate_req),
+			neg_req->min_version, neg_req->max_version,
+			neg_req->credits_requested);
+
+		/* We should initialize the parameters correctly */
+
+		/* We should save these values as well */
+
+		conn->state = SMBD_TRANSFER;
+		neg_resp = (struct smbd_negotiate_resp *)conn->send_buf;
+
+		neg_resp->min_version = neg_req->min_version;
+		neg_resp->max_version = neg_req->max_version;
+		neg_resp->negotiated_version = neg_req->min_version;
+		neg_resp->reserved = 0;
+		neg_resp->credits_requested = 255;
+		neg_resp->credits_granted = 16;
+		neg_resp->status = 0;
+		neg_resp->max_read_write_size = 65536;
+
+		/* Now, send the response */
+
+		start_send(conn);
+
+		break;
+
+	case SMBD_TRANSFER:
+
+		break;
+
+	case SMBD_ERROR:
+
+
+		break;
+
+	default:
+		printk(KERN_ERR "Connection in unknown state: %u, "
+			"disconnecting\n",
+			conn->state);
+		conn->state = SMBD_ERROR;
+		break;
+	}
+
+	return res;
 }
 
 /*
@@ -198,6 +327,20 @@ static void handle_completion_event(struct ib_cq *cq, void *ctx)
 	 * Get all the available completions ...
 	 */
 	while ((res = ib_poll_cq(conn->cq, 1, &wc)) == 1) {
+		int local_res = 0;
+
+		/*
+		 * If it is a bad WC, I think we need to go to ERROR state
+		 */
+		if (wc.status) {
+			printk(KERN_ERR "cq completion failed with ID: %Lx "
+				"status %d opcode %d vendor_err 0x%0x\n",
+				wc.wr_id, wc.status, wc.opcode, 
+				wc.vendor_err);
+			conn->state = SMBD_ERROR;
+			continue;
+		}
+
 		switch (wc.opcode) {
 		case IB_WC_SEND:
 			printk(KERN_INFO "SEND completion ...\n");
@@ -205,6 +348,7 @@ static void handle_completion_event(struct ib_cq *cq, void *ctx)
 
 		case IB_WC_RECV:
 			printk(KERN_INFO "RECV completion ...\n");
+			local_res = handle_recv_completion(&wc, conn);
 			break;
 
 		case IB_WC_RDMA_WRITE:
@@ -225,7 +369,17 @@ static void handle_completion_event(struct ib_cq *cq, void *ctx)
 	if (res) {
 		printk(KERN_ERR "%s: ib poll error: %d\n", __func__, res);
 
-		/* Nothing more can be done ... */
+		/*
+		 * We have a problem, so we should drop the connection
+		 */
+		conn->state = SMBD_ERROR;
+	}
+
+	/*
+	 * Clean up the connection
+	 */
+	if (conn->state == SMBD_ERROR) {
+
 		goto done;
 	}
 
@@ -327,10 +481,15 @@ handle_connect_request(struct rdma_cm_id *cm_id,
 	res = ib_dma_mapping_error(conn->cm_id->device, conn->recv_buf_dma);
 	if (res) {
 		printk(KERN_ERR "Failed to create DMA mapping: %d\n", res);
-		goto clean_dma;
+		goto clean_qp;
 	}
 
 	conn->recv_mr = ib_get_dma_mr(conn->pd, IB_ACCESS_LOCAL_WRITE);
+	if (IS_ERR(conn->recv_mr)) {
+		res = PTR_ERR(conn->recv_mr);
+		printk(KERN_ERR "Unable to get recv MR: %d\n", res);
+		goto clean_dma;
+	}
 
 	/*
 	 * Set up the work request ...
@@ -349,7 +508,7 @@ handle_connect_request(struct rdma_cm_id *cm_id,
 	res = ib_post_recv(conn->qp, &conn->recv_wr, &bad_wr);
 	if (res) {
 		printk(KERN_ERR "Unable to post a recv: %d\n", res);
-		goto clean_recv;
+		goto clean_mr;
 	}
 
 	/*
@@ -366,8 +525,10 @@ handle_connect_request(struct rdma_cm_id *cm_id,
 	}
 
 	cm_id->context = conn; /* How we find it again */
+	conn->state = SMBD_NEGOTIATE;
+
 	mutex_lock(&smbd_dev->connection_list_mutex);
-	list_add_tail(&smbd_dev->connection_list, &conn->connect_ent);
+	list_add_tail(&conn->connect_ent, &smbd_dev->connection_list);
 	mutex_unlock(&smbd_dev->connection_list_mutex);
 
 	printk(KERN_INFO "Accepted the connection ...\n");
@@ -376,14 +537,15 @@ handle_connect_request(struct rdma_cm_id *cm_id,
 
 clean_recv:
 
-clean_dma:
+clean_mr:
 	if (conn->recv_mr)
 		ib_dereg_mr(conn->recv_mr);
+clean_dma:
 	ib_dma_unmap_single(conn->cm_id->device,
 			    conn->recv_buf_dma,
 			    sizeof(conn->recv_buf),
 			    DMA_FROM_DEVICE);
-/*clean_qp: */
+clean_qp: 
 	ib_destroy_qp(conn->qp);
 clean_cq:
 	ib_destroy_cq(conn->cq);
@@ -408,8 +570,8 @@ handle_disconnect(struct rdma_cm_id *cma_id)
 
 	printk(KERN_INFO "Handling disconnect for %p\n", conn);
 
-	smbd_free_buffers(conn);
 	smbd_clean_connection(conn);
+	printk(KERN_INFO "Cleaned the connection ...\n");
 
 	mutex_lock(&smbd_dev->connection_list_mutex);
 	list_del(&conn->connect_ent);
@@ -525,8 +687,8 @@ static int teardown_listen_and_connections(struct smbd_device *smbd_dev)
 				&smbd_dev->connection_list, 
 				connect_ent) {
 
-		rdma_disconnect(conn->cm_id);
 		smbd_free_buffers(conn);
+		rdma_disconnect(conn->cm_id);
 
 		ib_destroy_qp(conn->qp);
 		ib_destroy_cq(conn->cq);

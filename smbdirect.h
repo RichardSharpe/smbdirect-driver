@@ -19,12 +19,42 @@
 #include <linux/cdev.h>
 #include <rdma/rdma_cm.h>
 
+enum smbd_states {
+	SMBD_NEGOTIATE = 0, /* This is the PASSIVE state in the spec */
+	SMBD_TRANSFER,      /* This is the ESTABLISHED state in the spec */
+	SMBD_ERROR,      /* There's been an error, drop the connection */
+};
+
+struct smbd_negotiate_req {
+	uint16_t min_version;
+	uint16_t max_version;
+	uint16_t reserved;
+	uint16_t credits_requested;
+	uint32_t preferred_send_size;
+	uint32_t max_receive_size;
+	uint32_t max_fragmented_size;
+} __attribute__((packed));
+
+struct smbd_negotiate_resp {
+	uint16_t min_version;
+	uint16_t max_version;
+	uint16_t negotiated_version;
+	uint16_t reserved;
+	uint16_t credits_requested;
+	uint16_t credits_granted;
+	uint32_t status;
+	uint32_t max_read_write_size;
+} __attribute__((packed));
+
 struct smbd_params {
-	unsigned int rcv_credit_max;
-	unsigned int snd_credit_max;
+	unsigned int send_credits;
+	unsigned int recv_credits;
+	unsigned int recv_credit_max;
+	unsigned int send_credit_target;
 	unsigned int max_snd_size;
-	unsigned int max_fragment_size;
-	unsigned int max_rcv_size;
+	unsigned int max_fragmented_size;
+	unsigned int max_receive_size;
+	unsigned int max_read_write_size;
 	unsigned int keepalive_interval;
 	unsigned int sec_blob_size;
 	void *sec_blob;
@@ -50,7 +80,7 @@ struct smbd_device {
  */
 struct connection_struct {
 	struct list_head connect_ent;
-	unsigned int connected;
+	enum smbd_states state;
 	unsigned long long session_id;
 	/*
 	 * RDMA stuff
