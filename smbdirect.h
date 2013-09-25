@@ -80,8 +80,10 @@ struct smbd_device {
  */
 struct connection_struct {
 	struct list_head connect_ent;
+	wait_queue_head_t wait_queue;
 	enum smbd_states state;
 	unsigned long long session_id;
+	struct work_struct cq_work;
 	/*
 	 * RDMA stuff
 	 */

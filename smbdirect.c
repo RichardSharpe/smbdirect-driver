@@ -61,7 +61,9 @@ static int read_proc_stuff(struct seq_file *m, void *data)
 /*
  * The device and file ops etc
  */
-struct smbd_device smbd_device;
+static struct smbd_device smbd_device;
+
+static struct workqueue_struct *smbd_wq;
 
 int smbd_open(struct inode *inode, struct file *filp)
 {
@@ -187,6 +189,12 @@ start_send(struct connection_struct *conn)
 	int res = 0;
 	struct ib_send_wr *bad_wr;
 
+	printk(KERN_INFO "Starting to send ...\n");
+
+	wait_event_interruptible_timeout(conn->wait_queue,
+					conn->state == SMBD_ERROR,
+					5);
+
 	conn->send_buf_dma = ib_dma_map_single(conn->cm_id->device,
 					       conn->send_buf,
 					       sizeof(conn->send_buf),
@@ -197,12 +205,24 @@ start_send(struct connection_struct *conn)
 		goto error;
 	}
 
-	conn->recv_mr = ib_get_dma_mr(conn->pd, 0);
-	if (IS_ERR(conn->recv_mr)) {
+	printk(KERN_INFO "Mapped the buffer ...\n");
+
+	wait_event_interruptible_timeout(conn->wait_queue,
+					conn->state == SMBD_ERROR,
+					5);
+
+	conn->send_mr = ib_get_dma_mr(conn->pd, 0);
+	if (IS_ERR(conn->send_mr)) {
 		printk(KERN_ERR "Failed to get the send MR: %ld\n",
 			PTR_ERR(conn->recv_mr));
 		goto error_dma;
 	}
+
+	printk(KERN_INFO "Got the memory region ...\n");
+
+	wait_event_interruptible_timeout(conn->wait_queue,
+					conn->state == SMBD_ERROR,
+					5);
 
 	/*
 	 * Set up the work request ...
@@ -211,6 +231,8 @@ start_send(struct connection_struct *conn)
 	conn->send_sgl.length = sizeof(conn->send_buf);
 	conn->send_sgl.lkey = conn->send_mr->lkey;
 
+	conn->send_wr.opcode = IB_WR_SEND;
+	conn->send_wr.send_flags = IB_SEND_SIGNALED;
 	conn->send_wr.sg_list = &conn->send_sgl;
 	conn->send_wr.num_sge = 1;
 	conn->send_wr.next = NULL;
@@ -307,21 +329,19 @@ handle_recv_completion(struct ib_wc *wc, struct connection_struct *conn)
 }
 
 /*
- * Handle a completion event ...
+ * Handle a completion event ... in a work qeue
  */
-static void handle_completion_event(struct ib_cq *cq, void *ctx)
+static void
+conn_cq_work(struct work_struct *work)
 {
-	struct connection_struct *conn = ctx;
+	struct connection_struct *conn = container_of(work,
+						struct connection_struct,
+						cq_work);
+
 	int res = 0;
 	struct ib_wc wc;
 
 	printk(KERN_INFO "Handling a completion event ...\n");
-
-	if (conn->cq != cq) {
-		printk(KERN_ERR "The completion queue is wrong: %p, %p\n",
-			conn->cq, cq);
-		return;
-	}
 
 	/*
 	 * Get all the available completions ...
@@ -334,7 +354,7 @@ static void handle_completion_event(struct ib_cq *cq, void *ctx)
 		 */
 		if (wc.status) {
 			printk(KERN_ERR "cq completion failed with ID: %Lx "
-				"status %d opcode %d vendor_err 0x%0x\n",
+				"status %d opcode 0x%0x vendor_err 0x%0x\n",
 				wc.wr_id, wc.status, wc.opcode, 
 				wc.vendor_err);
 			conn->state = SMBD_ERROR;
@@ -396,6 +416,24 @@ done:
 }
 
 /*
+ * Handle a completion event ... place on a work queue
+ */
+static void handle_completion_event(struct ib_cq *cq, void *ctx)
+{
+	struct connection_struct *conn = ctx;
+
+	if (conn->cq != cq) {
+		printk(KERN_ERR "The completion queue is wrong: %p, %p\n",
+			conn->cq, cq);
+		return;
+	}
+
+	printk(KERN_INFO "Handing completion off to a work queue\n");
+	INIT_WORK(&conn->cq_work, conn_cq_work);
+	queue_work(smbd_wq, &conn->cq_work);
+}
+
+/*
  * Handle connection requests ... build a new connection and set up the 
  * protection domain, completion queue and queue pair, hang a receive and
  * accept the connection.
@@ -420,6 +458,7 @@ handle_connect_request(struct rdma_cm_id *cm_id,
 
 	conn->cm_id = cm_id;
 	conn->dev = smbd_dev;
+	init_waitqueue_head(&conn->wait_queue);
 
 	/*
 	 * Now allocate a protection domain, completion queue etc.
@@ -599,6 +638,9 @@ smbd_cma_handler(struct rdma_cm_id *cma_id,
 	case RDMA_CM_EVENT_CONNECT_REQUEST:
 		res = handle_connect_request(cma_id, smbd_dev);
 		break;
+	case RDMA_CM_EVENT_ESTABLISHED:
+		printk("Received an established event. Ignored.\n");
+		break;
 	case RDMA_CM_EVENT_DISCONNECTED:
 		res = handle_disconnect(cma_id);
 		break;
@@ -680,6 +722,7 @@ static int teardown_listen_and_connections(struct smbd_device *smbd_dev)
 	int res = 0;
 	struct connection_struct *conn, *temp;
 
+	printk(KERN_INFO "%s: Emptying list ...\n", __func__);
 	/* We need to go through the list of connections and drop them */
 	mutex_lock(&smbd_dev->connection_list_mutex);
 	list_for_each_entry_safe(conn, 
@@ -734,6 +777,12 @@ static int __init smbdirect_init(void)
 		return res;
 	}
 
+	smbd_wq = alloc_workqueue("SMBDirect Work Queue", 0, 0);
+	if (!smbd_wq) {
+		printk(KERN_ERR "Unable to allocate work queue\n");
+		return ENOMEM;
+	}
+
 	memset(&smbd_device, 0, sizeof(smbd_device));
 	mutex_init(&smbd_device.connection_list_mutex);
 	INIT_LIST_HEAD(&smbd_device.connection_list);
@@ -750,7 +799,16 @@ static int __init smbdirect_init(void)
 	 * This should be called in the open function when we have initialized
 	 */
 	res = setup_listen(&smbd_device);
+	if (res) {
 
+		goto no_listen;
+	}
+
+	return res;
+
+no_listen:
+	cdev_del(&smbd_device.cdev);
+	destroy_workqueue(smbd_wq);
 no_cdev:
 	return res;
 }
@@ -759,6 +817,7 @@ static void __exit smbdirect_exit(void)
 {
 	(void)teardown_listen_and_connections(&smbd_device);
 	cdev_del(&smbd_device.cdev);
+	destroy_workqueue(smbd_wq);
 	remove_proc_entry("driver/smbdirect", NULL);
 }
 
