@@ -191,10 +191,6 @@ start_send(struct connection_struct *conn)
 
 	printk(KERN_INFO "Starting to send ...\n");
 
-	wait_event_interruptible_timeout(conn->wait_queue,
-					conn->state == SMBD_ERROR,
-					5);
-
 	conn->send_buf_dma = ib_dma_map_single(conn->cm_id->device,
 					       conn->send_buf,
 					       sizeof(conn->send_buf),
@@ -207,10 +203,6 @@ start_send(struct connection_struct *conn)
 
 	printk(KERN_INFO "Mapped the buffer ...\n");
 
-	wait_event_interruptible_timeout(conn->wait_queue,
-					conn->state == SMBD_ERROR,
-					5);
-
 	conn->send_mr = ib_get_dma_mr(conn->pd, 0);
 	if (IS_ERR(conn->send_mr)) {
 		printk(KERN_ERR "Failed to get the send MR: %ld\n",
@@ -219,10 +211,6 @@ start_send(struct connection_struct *conn)
 	}
 
 	printk(KERN_INFO "Got the memory region ...\n");
-
-	wait_event_interruptible_timeout(conn->wait_queue,
-					conn->state == SMBD_ERROR,
-					5);
 
 	/*
 	 * Set up the work request ...
@@ -613,7 +601,7 @@ handle_disconnect(struct rdma_cm_id *cma_id)
 	printk(KERN_INFO "Cleaned the connection ...\n");
 
 	mutex_lock(&smbd_dev->connection_list_mutex);
-	list_del(&conn->connect_ent);
+	list_del_init(&conn->connect_ent);
 	mutex_unlock(&smbd_dev->connection_list_mutex);
 
 	kfree(conn);
