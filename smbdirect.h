@@ -84,6 +84,7 @@ struct connection_struct {
 	enum smbd_states state;
 	unsigned long long session_id;
 	struct work_struct cq_work;
+	struct work_struct disconnect_work;
 	/*
 	 * RDMA stuff
 	 */
@@ -103,10 +104,12 @@ struct connection_struct {
 	/*
 	 * Buffers ...
 	 */
-	char recv_buf[20];         /* an SMB Direct  Negotiate req */
 	u64 recv_buf_dma;
-	char send_buf[32];	   /* The SMB Direct Neg response  */
 	u64 send_buf_dma;
+	char recv_buf[20];         /* an SMB Direct  Negotiate req */
+	char gap[32];
+	char send_buf[32];	   /* The SMB Direct Neg response  */
+	char gap1[32];
 	/*
 	 * The device we are related to ...
 	 */

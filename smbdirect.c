@@ -15,6 +15,7 @@
  * GNU General Public License for more details.
  ****************************************************************************/
 
+#include <linux/delay.h>
 #include <linux/init.h>
 #include <linux/string.h>
 #include <linux/module.h>
@@ -43,7 +44,8 @@
 #define MAX_CQ_DEPTH 128
 
 /* Our device number, for reporting */
-dev_t smbdirect_dev_no;
+static dev_t smbdirect_dev_no;
+static int connection_count = 0;
 
 /*
  * A /proc file for some debugging ... replace this with configfs stuff ...
@@ -51,8 +53,10 @@ dev_t smbdirect_dev_no;
 static int read_proc_stuff(struct seq_file *m, void *data)
 {
 
-	seq_printf(m, " %s: Loaded with major = %u, minor = %u\n",
+	seq_printf(m, " %s: Loaded with major = %u, minor = %u\n"
+			"Connection Count = %d\n",
 			"smbdirect",
+			connection_count,
 			MAJOR(smbdirect_dev_no),
 			MINOR(smbdirect_dev_no));
 	return 0;
@@ -167,16 +171,25 @@ smbd_free_buffers(struct connection_struct *conn)
  * Clean up a connection ...
  */
 static void
-smbd_clean_connection(struct connection_struct *conn)
+smbd_clean_connection(struct connection_struct *conn, bool disconnect)
 {
 	smbd_free_buffers(conn);
-	rdma_disconnect(conn->cm_id);
+	printk(KERN_INFO "Freed the buffers for conn: %p\n", conn);
+	msleep(1);
+
+	if (disconnect)
+		rdma_disconnect(conn->cm_id);
+	printk(KERN_INFO "Disconnected ...\n");
+	msleep(1);
 
 	ib_destroy_qp(conn->qp);
 	ib_destroy_cq(conn->cq);
 	ib_dealloc_pd(conn->pd);
+	printk(KERN_INFO "Cleaned up qp, cq and pd ... \n");
+	msleep(100);
 
 	rdma_destroy_id(conn->cm_id);
+	printk(KERN_INFO "Destroyed the cm_id\n");
 }
 
 /*
@@ -329,7 +342,7 @@ conn_cq_work(struct work_struct *work)
 	int res = 0;
 	struct ib_wc wc;
 
-	printk(KERN_INFO "Handling a completion event ...\n");
+	printk(KERN_INFO "Handling a completion event on conn: %p\n", conn);
 
 	/*
 	 * Get all the available completions ...
@@ -551,6 +564,8 @@ handle_connect_request(struct rdma_cm_id *cm_id,
 		goto clean_recv;
 	}
 
+	connection_count++;
+
 	cm_id->context = conn; /* How we find it again */
 	conn->state = SMBD_NEGOTIATE;
 
@@ -588,23 +603,49 @@ clean_conn:
  * Handle a connection disconnect. Simply clean the connection, delete it
  * from the list and free it.
  */
-static int
-handle_disconnect(struct rdma_cm_id *cma_id)
+static void
+smbd_disconnect_work(struct work_struct *work)
 {
-	int res = 0;
-	struct connection_struct *conn = cma_id->context;
+	struct connection_struct *conn = container_of(work,
+						struct connection_struct,
+						disconnect_work);
 	struct smbd_device *smbd_dev = conn->dev;
 
-	printk(KERN_INFO "Handling disconnect for %p\n", conn);
-
-	smbd_clean_connection(conn);
+	msleep(10);
+	/*
+	 * No need to disconnect. It is going away.
+	 */
+	smbd_clean_connection(conn, false);
 	printk(KERN_INFO "Cleaned the connection ...\n");
 
 	mutex_lock(&smbd_dev->connection_list_mutex);
 	list_del_init(&conn->connect_ent);
 	mutex_unlock(&smbd_dev->connection_list_mutex);
 
+	connection_count--;
+
+	printk(KERN_INFO "Freeing the connection and we are done ...\n");
 	kfree(conn);
+}
+
+static int
+handle_disconnect(struct rdma_cm_id *cma_id)
+{
+	int res = 0;
+	struct connection_struct *conn = cma_id->context;
+
+	/*
+	 * We are called in a context here where we cannot call
+	 * a bunch of CM function, so handle this in a workqueue
+	 */
+	if (conn) {
+		printk(KERN_INFO "Handling disconnect for %p\n", conn);
+		INIT_WORK(&conn->disconnect_work, smbd_disconnect_work);
+		queue_work(smbd_wq, &conn->disconnect_work);
+	} else {
+		printk(KERN_INFO "Received disconnect on incorrect cm_id: %p\n",
+		cma_id);
+	}
 
 	return res;
 }
@@ -633,7 +674,8 @@ smbd_cma_handler(struct rdma_cm_id *cma_id,
 		res = handle_disconnect(cma_id);
 		break;
 	case RDMA_CM_EVENT_DEVICE_REMOVAL:
-
+		printk("Received a device removal event. Ignored.\n");
+		break;
 	default:
 		printk(KERN_ERR "Unknown event type: %d\n", event->event);
 		break;
